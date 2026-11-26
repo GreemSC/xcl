@@ -1520,9 +1520,45 @@ const MAX_RB_JOBS: usize = 16;
 const MIN_RB_JOB_BYTES: usize = 256 << 10;
 static FREE_RB_JOBS: Mutex<Vec<ReadbackJob>> = Mutex::new(Vec::new());
 
+/// A job whose readback was still queued on the GPU when `readback_now` gave up waiting: its
+/// buffer, allocator and list stay alive until `fence` reaches `value`. Dropped earlier, the copy
+/// still runs later and writes into freed memory (under RADV: a GPU page fault, CPG write).
+struct InFlightRbJob {
+    job: ReadbackJob,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object; `ReadbackJob` is `Send`.
+unsafe impl Send for InFlightRbJob {}
+
+static IN_FLIGHT_RB_JOBS: Mutex<Vec<InFlightRbJob>> = Mutex::new(Vec::new());
+
+/// Keep `job` until its GPU readback (`fence` >= `value`) is done.
+fn keep_in_flight_readback_job(job: ReadbackJob, fence: ID3D12Fence, value: u64) {
+    IN_FLIGHT_RB_JOBS.lock().unwrap().push(InFlightRbJob { job, fence, value });
+}
+
+/// Jobs kept by `keep_in_flight_readback_job` whose readback has finished go back to the pool.
+unsafe fn reclaim_in_flight_readback_jobs() {
+    let done: Vec<ReadbackJob> = {
+        let mut v = IN_FLIGHT_RB_JOBS.lock().unwrap();
+        if v.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *v).into_iter().partition(|j| j.fence.GetCompletedValue() >= j.value);
+        *v = keep;
+        done.into_iter().map(|j| j.job).collect()
+    };
+    for job in done {
+        return_readback_job(job);
+    }
+}
+
 unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJob> {
     let dev_key = dev.as_raw() as usize;
     let want = need.max(MIN_RB_JOB_BYTES).min(READBACK_STAGING);
+    reclaim_in_flight_readback_jobs();
     {
         let mut free = FREE_RB_JOBS.lock().unwrap();
         if let Some(i) = free.iter().position(|j| j.dev_key == dev_key && j.cap >= want) {
@@ -1716,7 +1752,6 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let mut idx = 0usize;
     let mut sub_off = 0usize;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
-    let mut job_idle = true;
     let mut waited_title_queues = false;
     while idx < spans.len() {
         let mut used = 0usize;
@@ -1767,8 +1802,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                     wait_target.0.GetCompletedValue()
                 );
                 super::real::stop_if_device_removed();
-                job_idle = false;
-                break;
+                // the copy is still queued: keep its buffer alive until it has run
+                keep_in_flight_readback_job(job, wait_target.0.clone(), wait_target.1);
+                return;
             }
         }
         // 3. Copy only still-committed non-hole 64-byte chunks that were NOT modified by the CPU
@@ -1781,9 +1817,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         s.reclaim_ring();
     }
-    if job_idle {
-        return_readback_job(job);
-    }
+    return_readback_job(job);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -3404,6 +3438,27 @@ mod tests {
             assert!(ok, "wait_fence_until timed out instead of observing Signal(5)");
             assert!(fence.GetCompletedValue() >= 5, "returned early at {}", fence.GetCompletedValue());
             assert!(elapsed >= Duration::from_millis(50), "returned too early ({elapsed:?}) on a stale event signal");
+        }
+    }
+
+    /// A `readback_now` job that timed out with its copy still queued must not be handed out
+    /// (or freed) before that copy has run, then goes back to the pool.
+    #[test]
+    fn a_timed_out_readback_job_is_kept_until_its_copy_ran() {
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let job = take_readback_job(&dev, 1).expect("readback job");
+            let buf = job.buf.as_raw() as usize;
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            keep_in_flight_readback_job(job, fence.clone(), 1);
+            let other = take_readback_job(&dev, 1).expect("another job");
+            assert_ne!(other.buf.as_raw() as usize, buf, "a job whose copy is queued was handed out again");
+            assert!(IN_FLIGHT_RB_JOBS.lock().unwrap().iter().any(|j| j.job.buf.as_raw() as usize == buf), "the queued job was dropped");
+            return_readback_job(other);
+            fence.Signal(1).expect("signal");
+            reclaim_in_flight_readback_jobs();
+            assert!(!IN_FLIGHT_RB_JOBS.lock().unwrap().iter().any(|j| j.job.buf.as_raw() as usize == buf), "the job stayed in flight after its copy");
+            assert!(FREE_RB_JOBS.lock().unwrap().iter().any(|j| j.buf.as_raw() as usize == buf), "the job did not go back to the pool");
         }
     }
 
