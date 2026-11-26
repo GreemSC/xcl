@@ -452,6 +452,37 @@ pub fn pool_bytes() -> (usize, usize) {
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
 /// every page it touches; `init` commits them once the windows exist.
 static EARLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Ranges committed on the CPU in sparse windows whose VRAM tiles are mapped lazily on first
+/// non-zero CPU write (`alloc_lazy`) or GPU write target registration, avoiding eager VRAM
+/// allocation for untouched pages or GPU-owned render targets placed inside large title heaps.
+static LAZY_RANGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+static LAZY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn in_lazy_range(lazy: &BTreeMap<usize, usize>, a: usize) -> bool {
+    lazy.range(..=a).next_back().is_some_and(|(_, &e)| a < e)
+}
+
+fn lazy_overlaps_tile(lazy: &BTreeMap<usize, usize>, t: usize) -> bool {
+    lazy.range(..t.saturating_add(TILE)).next_back().is_some_and(|(_, &e)| e > t)
+}
+
+fn lazy_tile_holes(lazy: &BTreeMap<usize, usize>, t: usize) -> u16 {
+    let mut holes = 0u16;
+    for k in 0..PAGES_PER_TILE {
+        if !in_lazy_range(lazy, t + k * PAGE) {
+            holes |= 1u16 << k;
+        }
+    }
+    holes
+}
+
+fn page_has_nonzero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    if chunks.any(|c| u64::from_ne_bytes(c.try_into().unwrap()) != 0) {
+        return true;
+    }
+    chunks.remainder().iter().any(|&b| b != 0)
+}
 
 /// The pages `[a, a + n)` touches, as `[start, end)`.
 fn page_span(a: usize, n: usize) -> (usize, usize) {
@@ -552,9 +583,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+        let rb_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+        let rb_done_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -625,6 +656,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             drop(old_queue);
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -874,9 +906,7 @@ impl State {
         if target == 0 || self.fence.GetCompletedValue() >= target {
             return;
         }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
+        if !wait_fence_until(&self.fence, target, self.event, 5000) {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
             super::real::stop_if_device_removed();
         }
@@ -896,20 +926,19 @@ impl State {
     }
 
     #[inline]
-    unsafe fn wait_for_rb(&self, target: u64) {
-        if target == 0 || self.rb_done_fence.GetCompletedValue() >= target {
-            return;
+    /// Whether `rb_done_fence` reached `target` within 5 s (nothing to copy back otherwise).
+    unsafe fn wait_for_rb(&self, target: u64) -> bool {
+        if wait_fence_until(&self.rb_done_fence, target, self.event, 5000) {
+            return true;
         }
-        let _ = self.rb_done_fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.rb_done_fence.GetCompletedValue() < target {
-            crate::xlog_warn!(
-                "sparse: the readback queue has not reached fence value {target} after 5 s (at {})",
-                self.rb_done_fence.GetCompletedValue()
-            );
-            super::real::stop_if_device_removed();
-        }
+        crate::xlog_warn!(
+            "sparse: the readback queue has not reached fence value {target} after 5 s (at {})",
+            self.rb_done_fence.GetCompletedValue()
+        );
+        super::real::stop_if_device_removed();
+        false
     }
+
 
     #[inline]
     unsafe fn reclaim_ring(&mut self) {
@@ -950,6 +979,7 @@ impl State {
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
                 super::title_textures::own_work(|| {
+                    let _g = super::real::UnadoptGuard::new(l.as_raw()); // (tree C, Wine) see readback_now
                     self.queue.ExecuteCommandLists(&[Some(l)]);
                 });
             }
@@ -1112,14 +1142,19 @@ impl State {
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
+                            let _g = super::real::UnadoptGuard::new(l.as_raw()); // (tree C, Wine) see readback_now
                             s.rb_queue.ExecuteCommandLists(&[Some(l)]);
                         });
                     }
                 }
                 s.signal_rb();
                 s.rb_last_fence = s.rb_done_value;
-                s.wait_for_rb(s.rb_done_value);
+                let done = s.wait_for_rb(s.rb_done_value);
                 s.reclaim_ring();
+                if !done {
+                    // the GPU copy has not run: the staging bytes are not the readback yet
+                    pending.clear();
+                }
             }
             for (dst, off, len, snap) in pending.iter() {
                 let (dst, off, len) = (*dst, *off, *len);
@@ -1328,6 +1363,56 @@ impl State {
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
+/// 4 GiB window boundary when `size <= 4 GiB`). Commits CPU pages immediately but defers
+/// mapping 64 KiB VRAM tiles until the CPU writes non-zero data (or `place_buffer` pins them).
+pub unsafe fn alloc_lazy(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    let (start, end) = page_span(addr, rounded);
+    early_add(&mut LAZY_RANGES.lock().unwrap(), start, end);
+    LAZY_ACTIVE.store(true, Ordering::Release);
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.runs = None;
+    }
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    Some((addr, rounded))
+}
+
+/// Ensure any lazily-allocated sparse tiles overlapping `[a, a + n)` are backed by VRAM
+/// (called when the GPU is about to write directly to a buffer UAV or memory-op target).
+pub unsafe fn ensure_lazy_mapped(a: usize, n: usize) {
+    if n == 0 || !LAZY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if s.window_index(a).is_none() {
+        return;
+    }
+    let lazy = LAZY_RANGES.lock().unwrap();
+    if lazy.is_empty() {
+        return;
+    }
+    let first = a & !(TILE - 1);
+    let end = a.saturating_add(n);
+    let mut t = first;
+    while t < end {
+        if !s.mapped.contains_key(&t) && lazy_overlaps_tile(&lazy, t) {
+            let holes = lazy_tile_holes(&lazy, t);
+            s.ensure_mapped(t, TILE, |_| holes);
+        }
+        match t.checked_add(TILE) {
+            Some(next) => t = next,
+            None => break,
+        }
+    }
+}
+
+/// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
@@ -1440,6 +1525,122 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+/// A GPU wait a title queue has armed on a fence nothing has signalled yet (a `Wait64` bridged
+/// before its producer was submitted). Until it is met, work submitted to that queue after it
+/// cannot run: a readback ordered behind the queue would wait for the CPU that waits for it.
+/// (Taken from #1732's per-queue readback, which keeps readbacks off such queues.)
+struct QueueWait(ID3D12Fence, u64);
+
+// SAFETY: ID3D12Fence is a free-threaded COM object.
+unsafe impl Send for QueueWait {}
+
+static QUEUE_WAITS: Mutex<Option<FxHashMap<usize, Vec<QueueWait>>>> = Mutex::new(None);
+
+/// A readback of a title queue's GPU writes put off while that queue had an unmet wait: the
+/// queue signals `fence` >= `value` once the work before it has run (a fence of its own per
+/// queue: one fence signalled by several queues would let a fast queue complete a stalled
+/// one's value), and `deferred_readback_worker` reads the ranges back then (as #1732's
+/// per-queue readback did), not at the title's next submit, which may wait for this very value.
+struct DeferredReadback {
+    queue: usize,
+    ranges: Vec<(usize, usize)>,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object.
+unsafe impl Send for DeferredReadback {}
+
+struct QueueFence(ID3D12Fence, u64);
+
+// SAFETY: as above.
+unsafe impl Send for QueueFence {}
+
+static DEFERRED_READBACKS: Mutex<Vec<DeferredReadback>> = Mutex::new(Vec::new());
+static DEFERRED_FENCES: Mutex<Option<FxHashMap<usize, QueueFence>>> = Mutex::new(None);
+
+/// The put-off readbacks whose queue has run past them, taken out of the list.
+unsafe fn take_ready_deferred_readbacks() -> Vec<Vec<(usize, usize)>> {
+    let mut d = DEFERRED_READBACKS.lock().unwrap();
+    if d.is_empty() {
+        return Vec::new();
+    }
+    let (ready, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *d).into_iter().partition(|r| r.fence.GetCompletedValue() >= r.value);
+    *d = keep;
+    ready.into_iter().map(|r| r.ranges).collect()
+}
+
+/// Reads put-off readbacks back as soon as their queue has run past them (a 1 ms poll while any
+/// are pending), so a CPU waiting for those bytes (a `Wait64BitValueX`) is not left to time out.
+fn start_deferred_readback_worker() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-sparse-deferred-rb".into()).spawn(|| loop {
+            let pending = !DEFERRED_READBACKS.lock().unwrap().is_empty();
+            if !pending {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                continue;
+            }
+            let ready = unsafe { take_ready_deferred_readbacks() };
+            if ready.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            let mut g = lock_state();
+            if let Some(s) = g.as_mut() {
+                for ranges in ready {
+                    unsafe { s.readback_ranges(&ranges) };
+                }
+            }
+        });
+    });
+}
+
+/// Record an active GPU `queue.Wait(&fence, value)` on `queue` whose signal is not submitted yet.
+pub unsafe fn note_queue_wait(queue: usize, fence: ID3D12Fence, value: u64) {
+    // (Wine only: the readback put-off it drives is a Wine/vkd3d-proton ordering workaround)
+    if !crate::util::under_wine() || value == 0 || fence.GetCompletedValue() >= value {
+        return;
+    }
+    let mut g = QUEUE_WAITS.lock().unwrap();
+    let v = g.get_or_insert_with(FxHashMap::default).entry(queue).or_default();
+    v.retain(|w| w.0.GetCompletedValue() < w.1);
+    v.push(QueueWait(fence, value));
+}
+
+/// Whether `queue` still has a GPU wait recorded by `note_queue_wait` that is not met.
+unsafe fn queue_has_unsatisfied_wait(queue: usize) -> bool {
+    let mut g = QUEUE_WAITS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return false };
+    let Some(v) = m.get_mut(&queue) else { return false };
+    v.retain(|w| w.0.GetCompletedValue() < w.1);
+    if v.is_empty() {
+        m.remove(&queue);
+        return false;
+    }
+    true
+}
+
+/// Drop a released title queue's wait tracking and put-off readbacks (its address can be reused).
+pub fn forget_queue(queue: usize) {
+    if let Some(m) = QUEUE_WAITS.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
+    DEFERRED_READBACKS.lock().unwrap().retain(|r| r.queue != queue);
+    if let Some(m) = DEFERRED_FENCES.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
+}
+
+impl State {
+    /// Read back the put-off ranges whose queue has run past them (also done by the worker).
+    unsafe fn flush_deferred_readbacks(&mut self) {
+        for ranges in take_ready_deferred_readbacks() {
+            self.readback_ranges(&ranges);
+        }
+    }
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
@@ -1447,6 +1648,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_lazy_commits();
+    s.flush_deferred_readbacks();
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
         return;
@@ -1462,6 +1664,28 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
+    // the queue waits for a signal not submitted yet: its new work runs only after the title
+    // goes on, so waiting here for its readback would wait for ever (5 s at a time); later
+    let qid = queue.as_raw() as usize;
+    if queue_has_unsatisfied_wait(qid) {
+        let mut f = DEFERRED_FENCES.lock().unwrap();
+        let m = f.get_or_insert_with(FxHashMap::default);
+        if !m.contains_key(&qid) {
+            if let Ok(fence) = super::real::create_raw_fence(&s.dev) {
+                m.insert(qid, QueueFence(fence, 0));
+            }
+        }
+        // no fence or no signal: fall through to the ordered readback below rather than lose it
+        if let Some(qf) = m.get_mut(&qid) {
+            if queue.Signal(&qf.0, qf.1 + 1).is_ok() {
+                qf.1 += 1;
+                DEFERRED_READBACKS.lock().unwrap().push(DeferredReadback { queue: qid, ranges: merged, fence: qf.0.clone(), value: qf.1 });
+                drop(f);
+                start_deferred_readback_worker();
+                return;
+            }
+        }
+    }
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
@@ -1469,6 +1693,32 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         super::list_x::note_internal_wait(s.rb_queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
+}
+
+/// Wait until `fence` reaches `target` or `timeout_ms` passes; whether it was reached. `event`
+/// is reset first and the wait loops to the deadline: an auto-reset event can still hold the
+/// signal of an earlier wait that timed out (its fence passed later), and that stale signal used
+/// to end the next wait at once – a "not reached after 5 s" logged 1 ms after the last one, and
+/// readback bytes copied before the GPU copy had run (2026-11-26, 193 of 201 such waits).
+unsafe fn wait_fence_until(fence: &ID3D12Fence, target: u64, event: HANDLE, timeout_ms: u32) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = windows::Win32::System::Threading::ResetEvent(event);
+    if fence.SetEventOnCompletion(target, event).is_err() {
+        return fence.GetCompletedValue() >= target;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        if fence.GetCompletedValue() >= target {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        windows::Win32::System::Threading::WaitForSingleObject(event, (left.as_millis() as u32).max(1));
+    }
 }
 
 /// Pooled per-`Map` synchronous readback resources so concurrent `ID3D12Resource::Map` readbacks
@@ -1497,9 +1747,46 @@ const MAX_RB_JOBS: usize = 16;
 const MIN_RB_JOB_BYTES: usize = 256 << 10;
 static FREE_RB_JOBS: Mutex<Vec<ReadbackJob>> = Mutex::new(Vec::new());
 
+/// A job whose readback was still queued on the GPU when `readback_now` gave up waiting: its
+/// buffer, allocator and list stay alive until `fence` reaches `value`. Dropped earlier, the
+/// copy still runs later and writes into freed memory: under RADV a GPU page fault (CPG write,
+/// permission), the GPU stalls and the title's GPU watchdog ends it (2026-11-26).
+struct InFlightRbJob {
+    job: ReadbackJob,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object; `ReadbackJob` is `Send`.
+unsafe impl Send for InFlightRbJob {}
+
+static IN_FLIGHT_RB_JOBS: Mutex<Vec<InFlightRbJob>> = Mutex::new(Vec::new());
+
+/// Keep `job` until its GPU readback (`fence` >= `value`) is done.
+fn keep_in_flight_readback_job(job: ReadbackJob, fence: ID3D12Fence, value: u64) {
+    IN_FLIGHT_RB_JOBS.lock().unwrap().push(InFlightRbJob { job, fence, value });
+}
+
+/// Jobs kept by `keep_in_flight_readback_job` whose readback has finished go back to the pool.
+unsafe fn reclaim_in_flight_readback_jobs() {
+    let done: Vec<ReadbackJob> = {
+        let mut v = IN_FLIGHT_RB_JOBS.lock().unwrap();
+        if v.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *v).into_iter().partition(|j| j.fence.GetCompletedValue() >= j.value);
+        *v = keep;
+        done.into_iter().map(|j| j.job).collect()
+    };
+    for job in done {
+        return_readback_job(job);
+    }
+}
+
 unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJob> {
     let dev_key = dev.as_raw() as usize;
     let want = need.max(MIN_RB_JOB_BYTES).min(READBACK_STAGING);
+    reclaim_in_flight_readback_jobs();
     {
         let mut free = FREE_RB_JOBS.lock().unwrap();
         if let Some(i) = free.iter().position(|j| j.dev_key == dev_key && j.cap >= want) {
@@ -1597,6 +1884,21 @@ unsafe fn apply_readback_preserving_cpu_writes(
 /// `s.queue` behind active title queues via `rb_fence` before copying, and copies the range
 /// back from VRAM into CPU memory using a per-call pooled `ReadbackJob` whose GPU fence wait
 /// runs OUTSIDE the global `STATE` lock without clobbering concurrent CPU writes.
+/// Whether a `Map` readback (`readback_now`) is ordered behind every title queue first (ca427a52).
+/// Under Wine it is not by default, as in b5c0275: a title queue there can hold work that waits
+/// for the very CPU that waits for the readback. (The 201 "after 5 s" waits first blamed on this
+/// were mostly the stale-event cascade fixed in `wait_fence_until`; whether this is still needed
+/// is being measured.) Readbacks after a title submit stay ordered behind the queue that wrote.
+/// `XCL_MAP_READBACK_TITLE_WAIT=1` / `=0` forces either way.
+fn map_readback_orders_title_queues() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_MAP_READBACK_TITLE_WAIT").ok().as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => !crate::util::under_wine(),
+    })
+}
+
 pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
@@ -1616,6 +1918,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             return;
         }
         s.drain_lazy_commits();
+        s.flush_deferred_readbacks();
         let zeroed = std::mem::take(&mut s.to_zero);
         if !zeroed.is_empty() {
             for &(a, n) in &zeroed {
@@ -1684,7 +1987,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let Some(job) = take_readback_job(&dev, total_need) else {
         let mut g = lock_state();
         if let Some(s) = g.as_mut() {
-            s.wait_title_queues_for_readback();
+            if map_readback_orders_title_queues() {
+                s.wait_title_queues_for_readback();
+            }
             s.readback_ranges(&[(va, len)]);
         }
         return;
@@ -1693,7 +1998,6 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let mut idx = 0usize;
     let mut sub_off = 0usize;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
-    let mut job_idle = true;
     let mut waited_title_queues = false;
     while idx < spans.len() {
         let mut used = 0usize;
@@ -1726,28 +2030,30 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             let mut g = lock_state();
             let Some(s) = g.as_mut() else { break };
             s.order_rb_after_uploads();
-            if !waited_title_queues {
+            if !waited_title_queues && map_readback_orders_title_queues() {
                 s.wait_title_queues_for_readback();
-                waited_title_queues = true;
             }
+            waited_title_queues = true;
             super::title_textures::own_work(|| {
+                // (tree C, Wine) a list made after the device was adopted carries XCL's vtable; this
+                // queue was made before (native, no `q_execute_command_lists`): native for the call
+                let _g = super::real::UnadoptGuard::new(cmd_list.as_raw());
                 s.rb_queue.ExecuteCommandLists(&[Some(cmd_list)]);
             });
             s.signal_rb();
             (s.rb_done_fence.clone(), s.rb_done_value)
         };
         if wait_target.1 > 0 && wait_target.0.GetCompletedValue() < wait_target.1 {
-            let _ = wait_target.0.SetEventOnCompletion(wait_target.1, job.event);
-            windows::Win32::System::Threading::WaitForSingleObject(job.event, 5000);
-            if wait_target.0.GetCompletedValue() < wait_target.1 {
+            if !wait_fence_until(&wait_target.0, wait_target.1, job.event, 5000) {
                 crate::xlog_warn!(
                     "sparse: readback_now queue has not reached fence value {} after 5 s (at {})",
                     wait_target.1,
                     wait_target.0.GetCompletedValue()
                 );
                 super::real::stop_if_device_removed();
-                job_idle = false;
-                break;
+                // the copy is still queued: keep its buffer alive until it has run
+                keep_in_flight_readback_job(job, wait_target.0.clone(), wait_target.1);
+                return;
             }
         }
         // 3. Copy only still-committed non-hole 64-byte chunks that were NOT modified by the CPU
@@ -1760,9 +2066,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         s.reclaim_ring();
     }
-    if job_idle {
-        return_readback_job(job);
-    }
+    return_readback_job(job);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -1787,13 +2091,29 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    let (start, end) = page_span(a, n);
+    let lazy_changed = {
+        let mut lazy = LAZY_RANGES.lock().unwrap();
+        let before = lazy.len();
+        let had = lazy.range(..end).next_back().is_some_and(|(_, &e)| e > start);
+        if had {
+            early_remove(&mut lazy, start, end);
+        }
+        had || lazy.len() != before
+    };
     let mut g = lock_state();
     let Some(s) = g.as_mut() else {
-        let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
+        if lazy_changed {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
         return;
     };
     s.decommit_range(a, n);
+    if lazy_changed {
+        s.runs = None;
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Clear per-page hole bits in `[a, a + n)` for already-mapped tiles; if any VRAM-only tile
@@ -1970,6 +2290,11 @@ impl State {
                 continue;
             }
             seen.push(raw);
+            // a queue held by a wait whose signal is not submitted yet would hold this readback
+            // (and the `Map` waiting for it) until the title goes on: never, see `note_queue_wait`
+            if queue_has_unsatisfied_wait(raw) {
+                continue;
+            }
             self.rb_value += 1;
             let v = self.rb_value;
             if q.Signal(&self.rb_fence, v).is_ok() {
@@ -2003,7 +2328,7 @@ impl State {
         for (key, q) in active {
             let entry = match self.queue_fences.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                std::collections::hash_map::Entry::Vacant(e) => match super::real::create_raw_fence(&self.dev) {
                     Ok(fence) => e.insert((fence, 0)),
                     Err(_) => return None,
                 },
@@ -2198,7 +2523,21 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        s.runs = Some(watchable_tile_runs(&s.mapped));
+        // watchable tiles plus the lazily mapped ranges (Wine stack, #877)
+        let mut spans: Vec<(usize, usize)> = watchable_tile_runs(&s.mapped);
+        {
+            let lazy = LAZY_RANGES.lock().unwrap();
+            spans.extend(lazy.iter().map(|(&a, &b)| (a, b)));
+        }
+        spans.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in spans {
+            match runs.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => runs.push((a, b)),
+            }
+        }
+        s.runs = Some(runs);
     }
     s.runs.clone().unwrap_or_default()
 }
@@ -2233,12 +2572,14 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let mut zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
+    let lazy = LAZY_RANGES.lock().unwrap();
+    let has_lazy = !lazy.is_empty();
     let mut i = 0;
     while i < dirty.len() {
         let a = dirty[i];
@@ -2248,24 +2589,59 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             n += page;
             i += 1;
         }
-        // only what has video memory (committed tiles of a sparse window)
+        // only what has video memory (committed tiles of a sparse window), lazily mapping tiles
+        // in `LAZY_RANGES` on the first non-zero CPU write
         let mut x = a;
         while x < a + n {
             let t = x & !(TILE - 1);
             let end = (t + TILE).min(a + n);
-            if let Some(entry) = s.mapped.get_mut(&t) {
+            let mut just_mapped = false;
+            if !s.mapped.contains_key(&t) && has_lazy && lazy_overlaps_tile(&lazy, t) {
                 let mut pg = x & !(PAGE - 1);
+                let mut any_nz = false;
                 while pg < end {
-                    let idx = (pg - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                    if in_lazy_range(&lazy, pg) && page_has_nonzero(std::slice::from_raw_parts(pg as *const u8, PAGE)) {
+                        any_nz = true;
+                        break;
                     }
                     pg += PAGE;
+                }
+                if any_nz {
+                    let holes = lazy_tile_holes(&lazy, t);
+                    s.ensure_mapped(t, TILE, |_| holes);
+                    just_mapped = true;
+                    if let Some(entry) = s.mapped.get_mut(&t) {
+                        for idx in 0..PAGES_PER_TILE {
+                            if entry.holes & (1u16 << idx) == 0 {
+                                let pg = t + idx * PAGE;
+                                let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                                scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                            }
+                        }
+                    }
+                }
+            }
+            if !just_mapped {
+                if let Some(entry) = s.mapped.get_mut(&t) {
+                    let mut pg = x & !(PAGE - 1);
+                    while pg < end {
+                        let idx = (pg - t) / PAGE;
+                        if entry.holes & (1u16 << idx) == 0 {
+                            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                            scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                        }
+                        pg += PAGE;
+                    }
                 }
             }
             x = end;
         }
+    }
+    drop(lazy);
+    // Any recycled pool tiles mapped lazily above must be zeroed BEFORE `dirty_runs` uploads
+    // their non-zero chunks (keep the `sent` hashes `scan_page` just computed).
+    if !s.to_zero.is_empty() {
+        zero_runs.extend(s.to_zero.drain(..));
     }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
@@ -3352,6 +3728,27 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    #[test]
+    fn lazy_range_helpers_track_tile_overlap_holes_and_nonzero_pages() {
+        let base = 0x5_0000_0000usize;
+        let mut lazy = BTreeMap::new();
+        // Partially cover tile 0 (pages 4..8) and fully cover tile 2.
+        early_add(&mut lazy, base + 4 * PAGE, base + 8 * PAGE);
+        early_add(&mut lazy, base + 2 * TILE, base + 3 * TILE);
+
+        assert!(lazy_overlaps_tile(&lazy, base));
+        assert!(!lazy_overlaps_tile(&lazy, base + TILE));
+        assert!(lazy_overlaps_tile(&lazy, base + 2 * TILE));
+        assert_eq!(lazy_tile_holes(&lazy, base), 0xFFFF & !(0b1111u16 << 4));
+        assert_eq!(lazy_tile_holes(&lazy, base + TILE), 0xFFFF);
+        assert_eq!(lazy_tile_holes(&lazy, base + 2 * TILE), 0);
+
+        let mut page = vec![0u8; PAGE];
+        assert!(!page_has_nonzero(&page));
+        page[PAGE - 1] = 1;
+        assert!(page_has_nonzero(&page));
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
