@@ -5329,12 +5329,15 @@ fn big_compile_headroom(dxil_len: usize) -> u64 {
     (3u64 << 30).max(dxil_len as u64 * 512)
 }
 
-/// That much physical RAM and commit is free (true when that is not known).
+/// That much commit is free (true when that is not known). Free physical memory is not the
+/// measure, as for the pipeline workers (`pso_async::avail_commit_bytes`): under Wine it is the
+/// whole machine's, and at 1–2 GB it held every worker here while the title waited for one.
 fn big_compile_commit_free(need: u64) -> bool {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPhys.min(m.ullAvailPageFile) >= need }
+    big_compile_room(super::pso_async::avail_commit_bytes(), need)
+}
+
+fn big_compile_room(avail_commit: Option<u64>, need: u64) -> bool {
+    avail_commit.map_or(true, |avail| avail >= need)
 }
 
 #[cfg(test)]
@@ -5342,6 +5345,16 @@ mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn big_compile_room_is_free_commit_not_free_ram() {
+        let need = big_compile_headroom(0);
+        assert!(big_compile_room(Some(need), need));
+        assert!(!big_compile_room(Some(need - 1), need));
+        // a world load: 1.3 GB of RAM free, 12 GB of commit – the compile may start
+        assert!(big_compile_room(Some(12 << 30), need));
+        assert!(big_compile_room(None, need));
+    }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {

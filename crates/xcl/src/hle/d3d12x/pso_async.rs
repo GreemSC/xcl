@@ -498,7 +498,7 @@ fn mem_throttle_enabled() -> bool {
 /// not it: a retail title's world entry dropped it to 1.3 GB for a few seconds with 12 GB of
 /// commit free – the pages go to the page file – and the throttle on it held every pipeline
 /// worker idle while the title waited 14 s for a compute pipeline.)
-fn avail_commit_bytes() -> Option<u64> {
+pub(super) fn avail_commit_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
