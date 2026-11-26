@@ -144,7 +144,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
-    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
+    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title), and
+    // which title fences and XCL queue waits are behind then
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
         let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
@@ -155,6 +156,35 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     std::thread::sleep(std::time::Duration::from_secs_f64(left));
                 }
                 crate::eh::dump_threads();
+                crate::hle::d3d12x::list_x::log_sync_state(&format!("{s} s"));
+            }
+        });
+    }
+    // `XCL_STALL_DUMP=n`: once the title has presented frames and then presents none for n
+    // seconds (a stalled frame loop), where every thread is goes to the log – twice, a second
+    // apart, to tell stuck threads from moving ones – and the title ends as for
+    // `XCL_RUN_SECONDS`: a stall diagnosed without waiting for the title's own watchdog.
+    if let Some(secs) = stall_seconds(std::env::var("XCL_STALL_DUMP").ok().as_deref()) {
+        let _ = std::thread::Builder::new().name("xcl-stall-dump".into()).spawn(move || {
+            let mut last = crate::hle::d3d12x::present::presents();
+            let mut since = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let now = crate::hle::d3d12x::present::presents();
+                if now != last {
+                    (last, since) = (now, std::time::Instant::now());
+                    continue;
+                }
+                if !stalled(last, since.elapsed(), secs) {
+                    continue;
+                }
+                crate::xlog_warn!("XCL_STALL_DUMP: no frame presented for {secs} s after frame {last} – where every thread is, then the end");
+                crate::eh::dump_threads();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                crate::eh::dump_threads();
+                crate::report::write_final(None);
+                crate::log::flush();
+                crate::hle::d3d12x::real::end_title(0);
             }
         });
     }
@@ -216,4 +246,38 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::log::flush();
     crate::hle::kernelx::restore_fine_timer();
     code as i32
+}
+
+/// `XCL_STALL_DUMP`'s value: seconds without a frame, if it is a positive number.
+fn stall_seconds(value: Option<&str>) -> Option<f64> {
+    value.and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s > 0.0)
+}
+
+/// Whether the title has stalled for `XCL_STALL_DUMP`: it has presented a frame (`last` is the
+/// count seen) and no other for `secs`. A title still at its first frame has not.
+fn stalled(last: u64, idle: std::time::Duration, secs: f64) -> bool {
+    last > 0 && idle.as_secs_f64() >= secs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn stall_dump_takes_a_positive_number_of_seconds() {
+        assert_eq!(stall_seconds(Some("6")), Some(6.0));
+        assert_eq!(stall_seconds(Some(" 2.5 ")), Some(2.5));
+        for v in [None, Some(""), Some("0"), Some("-3"), Some("abc"), Some("inf"), Some("NaN")] {
+            assert_eq!(stall_seconds(v), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn a_stall_needs_a_presented_frame_and_the_full_wait() {
+        assert!(!stalled(0, Duration::from_secs(600), 6.0), "no frame presented yet");
+        assert!(!stalled(940, Duration::from_millis(5_999), 6.0));
+        assert!(stalled(940, Duration::from_secs(6), 6.0));
+        assert!(stalled(1, Duration::from_secs(60), 6.0));
+    }
 }

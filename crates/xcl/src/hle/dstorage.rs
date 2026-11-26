@@ -805,7 +805,7 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(pages)
 }
 
-unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
+pub(crate) unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;
@@ -985,6 +985,9 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        if crate::util::under_wine() {
+            crate::hle::d3d12x::title_textures::mark_dirty_range(r.destination as usize, n);
+        }
     }
     Ok(())
 }
